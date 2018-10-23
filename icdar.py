@@ -11,6 +11,7 @@ import matplotlib.patches as Patches
 from shapely.geometry import Polygon
 
 import tensorflow as tf
+import logging
 
 from data_util import GeneratorEnqueuer
 
@@ -35,7 +36,7 @@ FLAGS = tf.app.flags.FLAGS
 
 def get_images():
     files = []
-    for ext in ['jpg', 'png', 'jpeg', 'JPG']:
+    for ext in ['jpg', 'png', 'jpeg', 'JPG', 'tiff']:
         files.extend(glob.glob(
             os.path.join(FLAGS.training_data_path, '*.{}'.format(ext))))
     return files
@@ -46,6 +47,18 @@ def load_annoataion(p):
     load annotation from the text file
     :param p:
     :return:
+    '''
+    annotated_data = np.load(p).item().values()
+    text_polys = []
+    text_tags = []
+    for label in annotated_data:
+        if (label['vertices'][3][0] and label['vertices'][3][1] and label['vertices'][2][0] and label['vertices'][2][1] and label['vertices'][1][0] and label['vertices'][1][1] and label['vertices'][0][0] and label['vertices'][0][1]):
+            text_polys.append([[label['vertices'][3][0],label['vertices'][3][1]],[label['vertices'][2][0],label['vertices'][2][1]],[label['vertices'][1][0],label['vertices'][1][1]],[label['vertices'][0][0],label['vertices'][0][1]]])
+            if label['name'] == '*' or label == '###':
+                text_tags.append(True)
+            else:
+                text_tags.append(False)
+    return np.array(text_polys, dtype=np.float32), np.array(text_tags, dtype=np.bool)
     '''
     text_polys = []
     text_tags = []
@@ -65,8 +78,7 @@ def load_annoataion(p):
             else:
                 text_tags.append(False)
         return np.array(text_polys, dtype=np.float32), np.array(text_tags, dtype=np.bool)
-
-
+   ''' 
 def polygon_area(poly):
     '''
     compute area of a polygon
@@ -579,15 +591,22 @@ def generate_rbox(im_size, polys, tags):
             geo_map[y, x, 4] = rotate_angle
     return score_map, geo_map, training_mask
 
-
+train_data_list = ["D0006-0285025","D0041-5370026","D0042-1070003","D0042-1070006","D0042-1070010","D0042-1070015","D0017-1592006","D0042-1070001","D0042-1070004","D0042-1070007","D0042-1070012","D0079-0019007","D0041-5370006","D0042-1070002","D0042-1070005","D0042-1070009","D0042-1070013","D0089-5235001"]
 def generator(input_size=512, batch_size=32,
               background_ratio=3./8,
               random_scale=np.array([0.5, 1, 2.0, 3.0]),
               vis=False):
-    image_list = np.array(get_images())
-    print('{} training images in {}'.format(
-        image_list.shape[0], FLAGS.training_data_path))
-    index = np.arange(0, image_list.shape[0])
+    print "?????????!!!!!!!!!!!!!!"
+    with open('Data/cropped_annotations_train.txt', 'r') as f:
+    	annotation_file = f.readlines()
+    index = []
+    idx = 0
+    for line in annotation_file:
+	if len(line)>1 and line[:6] == './crop':    
+	    if line[14:27] in train_data_list:
+                index.append(idx)
+	idx += 1
+    index = np.array(index)
     while True:
         np.random.shuffle(index)
         images = []
@@ -597,18 +616,36 @@ def generator(input_size=512, batch_size=32,
         training_masks = []
         for i in index:
             try:
-                im_fn = image_list[i]
-                im = cv2.imread(im_fn)
-                # print im_fn
+                im_fn = 'Data/cropped_img_train/'
+		for fml in range(14,len(annotation_file[i])-1):
+		    im_fn += annotation_file[i][fml]
+                im = cv2.imread(str(im_fn))
+                #im = np.concatenate((im, im), axis=2)
                 h, w, _ = im.shape
-                txt_fn = im_fn.replace(os.path.basename(im_fn).split('.')[1], 'txt')
-                if not os.path.exists(txt_fn):
-                    print('text file {} does not exists'.format(txt_fn))
-                    continue
+		text_polys = []
+		text_tags = []
+		for idx in range(i+2,i+2+int(annotation_file[i+1])):
+                    annotation_data = annotation_file[idx]
+                    annotation_data = annotation_data.split(" ")
+                    x = annotation_data[0]
+                    x = float(x)
+                    y = annotation_data[1]
+                    w = annotation_data[2]
+                    h = annotation_data[3]
+                    y = float(y)
+                    w = float(w)
+                    h = float(h) 
+		    text_polys.append([[int(x),int(y-h)],[int(x+w),int(y-h)],[int(x+w),int(y)],[int(x),int(y)]])
+		    text_tags.append(True)
+                text_polys, text_tags = np.array(text_polys, dtype=np.float32), np.array(text_tags, dtype=np.bool)
+                #txt_fn = im_fn.replace(os.path.basename(im_fn).split('.')[1], 'npy')
+                #if not os.path.exists(txt_fn):
+                #    print('text file {} does not exists'.format(txt_fn[0:11]+'gt_'+txt_fn[11:]))
+                #    continue
 
-                text_polys, text_tags = load_annoataion(txt_fn)
+                #text_polys, text_tags = load_annoataion(txt_fn)
 
-                text_polys, text_tags = check_and_validate_polys(text_polys, text_tags, (h, w))
+                #text_polys, text_tags = check_and_validate_polys(text_polys, text_tags, (h, w))
                 # if text_polys.shape[0] == 0:
                 #     continue
                 # random scale this image
@@ -627,6 +664,10 @@ def generator(input_size=512, batch_size=32,
                     new_h, new_w, _ = im.shape
                     max_h_w_i = np.max([new_h, new_w, input_size])
                     im_padded = np.zeros((max_h_w_i, max_h_w_i, 3), dtype=np.uint8)
+                    print "shape of im_padded"
+                    print np.shape(im_padded)
+                    print "shape of im"
+                    print np.shape(im)
                     im_padded[:new_h, :new_w, :] = im.copy()
                     im = cv2.resize(im_padded, dsize=(input_size, input_size))
                     score_map = np.zeros((input_size, input_size), dtype=np.uint8)
@@ -705,7 +746,11 @@ def generator(input_size=512, batch_size=32,
                 score_maps.append(score_map[::4, ::4, np.newaxis].astype(np.float32))
                 geo_maps.append(geo_map[::4, ::4, :].astype(np.float32))
                 training_masks.append(training_mask[::4, ::4, np.newaxis].astype(np.float32))
-
+                print "Printing image sizes..."
+                print len(images)
+                print images[0].shape
+                print np.shape(images[0])
+                print "wtf"
                 if len(images) == batch_size:
                     yield images, image_fns, score_maps, geo_maps, training_masks
                     images = []

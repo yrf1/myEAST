@@ -1,40 +1,15 @@
-import cv2
-import time
-import math
 import os
+import cv2
 import numpy as np
-import tensorflow as tf
-
-import locality_aware_nms as nms_locality
 import lanms
-
-tf.app.flags.DEFINE_string('test_data_path', '/tmp/ch4_test_images/images/', '')
-tf.app.flags.DEFINE_string('gpu_list', '0', '')
-tf.app.flags.DEFINE_string('checkpoint_path', '/tmp/east_icdar2015_resnet_v1_50_rbox/', '')
-tf.app.flags.DEFINE_string('output_dir', '/tmp/ch4_test_images/images/', '')
-tf.app.flags.DEFINE_bool('no_write_images', False, 'do not write images')
-
 import model
+import logging
+import tensorflow as tf
+from shapely.geometry import Polygon
 from icdar import restore_rectangle
 
+tf.app.flags.DEFINE_string('checkpoint_path', 'east_icdar2015_resnet_v1_50_rbox/', '')
 FLAGS = tf.app.flags.FLAGS
-
-def get_images():
-    '''
-    find image files in test data path
-    :return: list of files found
-    '''
-    files = []
-    exts = ['jpg', 'png', 'jpeg', 'JPG']
-    for parent, dirnames, filenames in os.walk(FLAGS.test_data_path):
-        for filename in filenames:
-            for ext in exts:
-                if filename.endswith(ext):
-                    files.append(os.path.join(parent, filename))
-                    break
-    print('Find {} images'.format(len(files)))
-    return files
-
 
 def resize_image(im, max_side_len=2400):
     '''
@@ -65,17 +40,9 @@ def resize_image(im, max_side_len=2400):
 
     return im, (ratio_h, ratio_w)
 
-
-def detect(score_map, geo_map, timer, score_map_thresh=0.8, box_thresh=0.1, nms_thres=0.2):
+def detect(score_map, geo_map, score_map_thresh=0.1, box_thresh=0.005, nms_thres=0.25):
     '''
-    restore text boxes from score map and geo map
-    :param score_map:
-    :param geo_map:
-    :param timer:
-    :param score_map_thresh: threshhold for score map
-    :param box_thresh: threshhold for boxes
-    :param nms_thres: threshold for nms
-    :return:
+
     '''
     if len(score_map.shape) == 4:
         score_map = score_map[0, :, :, 0]
@@ -84,32 +51,24 @@ def detect(score_map, geo_map, timer, score_map_thresh=0.8, box_thresh=0.1, nms_
     xy_text = np.argwhere(score_map > score_map_thresh)
     # sort the text boxes via the y axis
     xy_text = xy_text[np.argsort(xy_text[:, 0])]
-    # restore
-    start = time.time()
+
     text_box_restored = restore_rectangle(xy_text[:, ::-1]*4, geo_map[xy_text[:, 0], xy_text[:, 1], :]) # N*4*2
-    print('{} text boxes before nms'.format(text_box_restored.shape[0]))
     boxes = np.zeros((text_box_restored.shape[0], 9), dtype=np.float32)
     boxes[:, :8] = text_box_restored.reshape((-1, 8))
     boxes[:, 8] = score_map[xy_text[:, 0], xy_text[:, 1]]
-    timer['restore'] = time.time() - start
-    # nms part
-    start = time.time()
-    # boxes = nms_locality.nms_locality(boxes.astype(np.float64), nms_thres)
     boxes = lanms.merge_quadrangle_n9(boxes.astype('float32'), nms_thres)
-    timer['nms'] = time.time() - start
 
     if boxes.shape[0] == 0:
-        return None, timer
+        return None
 
     # here we filter some low score boxes by the average score map, this is different from the orginal paper
     for i, box in enumerate(boxes):
         mask = np.zeros_like(score_map, dtype=np.uint8)
-        cv2.fillPoly(mask, box[:8].reshape((-1, 4, 2)).astype(np.int32) // 4, 1)
+        cv2.fillPoly(mask, box[:8].reshape((-1, 4, 2)).astype(np.int32) // 4, color=np.array((255,0,0)))
         boxes[i, 8] = cv2.mean(score_map, mask)[0]
     boxes = boxes[boxes[:, 8] > box_thresh]
 
-    return boxes, timer
-
+    return boxes	
 
 def sort_poly(p):
     min_axis = np.argmin(np.sum(p, axis=1))
@@ -119,76 +78,65 @@ def sort_poly(p):
     else:
         return p[[0, 3, 2, 1]]
 
+def checkIOU(boxA, boxB):
+        boxA = Polygon([(boxA[0,0], boxA[0,1]), (boxA[1,0], boxA[1,1]), (boxA[2,0], boxA[2,1]), (boxA[3,0], boxA[3,1])])
+        boxB = Polygon([(int(float(boxB[0])),int(float(boxB[1])-float(boxB[3]))), (int(float(boxB[0])+float(boxB[2])), int(float(boxB[1])-float(boxB[3]))), (int(float(boxB[0])+float(boxB[2])), int(float(boxB[1]))), (int(float(boxB[0])), int(float(boxB[1])))])
+        if (boxA.is_valid == False):
+             return False
+        intersection = boxA.intersection(boxB).area
+        union = float(boxA.area + boxB.area - intersection)
+        return intersection / union > 0.5
 
 def main(argv=None):
-    import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = FLAGS.gpu_list
-
-
-    try:
-        os.makedirs(FLAGS.output_dir)
-    except OSError as e:
-        if e.errno != 17:
-            raise
-
-    with tf.get_default_graph().as_default():
-        input_images = tf.placeholder(tf.float32, shape=[None, None, None, 3], name='input_images')
-        global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
-
-        f_score, f_geometry = model.model(input_images, is_training=False)
-
-        variable_averages = tf.train.ExponentialMovingAverage(0.997, global_step)
-        saver = tf.train.Saver(variable_averages.variables_to_restore())
-
-        with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
-            ckpt_state = tf.train.get_checkpoint_state(FLAGS.checkpoint_path)
-            model_path = os.path.join(FLAGS.checkpoint_path, os.path.basename(ckpt_state.model_checkpoint_path))
-            print('Restore from {}'.format(model_path))
-            saver.restore(sess, model_path)
-
-            im_fn_list = get_images()
-            for im_fn in im_fn_list:
-                im = cv2.imread(im_fn)[:, :, ::-1]
-                start_time = time.time()
-                im_resized, (ratio_h, ratio_w) = resize_image(im)
-
-                timer = {'net': 0, 'restore': 0, 'nms': 0}
-                start = time.time()
-                score, geometry = sess.run([f_score, f_geometry], feed_dict={input_images: [im_resized]})
-                timer['net'] = time.time() - start
-
-                boxes, timer = detect(score_map=score, geo_map=geometry, timer=timer)
-                print('{} : net {:.0f}ms, restore {:.0f}ms, nms {:.0f}ms'.format(
-                    im_fn, timer['net']*1000, timer['restore']*1000, timer['nms']*1000))
-
-                if boxes is not None:
-                    boxes = boxes[:, :8].reshape((-1, 4, 2))
-                    boxes[:, :, 0] /= ratio_w
-                    boxes[:, :, 1] /= ratio_h
-
-                duration = time.time() - start_time
-                print('[timing] {}'.format(duration))
-
-                # save to file
-                if boxes is not None:
-                    res_file = os.path.join(
-                        FLAGS.output_dir,
-                        '{}.txt'.format(
-                            os.path.basename(im_fn).split('.')[0]))
-
-                    with open(res_file, 'w') as f:
-                        for box in boxes:
-                            # to avoid submitting errors
-                            box = sort_poly(box.astype(np.int32))
-                            if np.linalg.norm(box[0] - box[1]) < 5 or np.linalg.norm(box[3]-box[0]) < 5:
-                                continue
-                            f.write('{},{},{},{},{},{},{},{}\r\n'.format(
-                                box[0, 0], box[0, 1], box[1, 0], box[1, 1], box[2, 0], box[2, 1], box[3, 0], box[3, 1],
-                            ))
-                            cv2.polylines(im[:, :, ::-1], [box.astype(np.int32).reshape((-1, 1, 2))], True, color=(255, 255, 0), thickness=1)
-                if not FLAGS.no_write_images:
-                    img_path = os.path.join(FLAGS.output_dir, os.path.basename(im_fn))
-                    cv2.imwrite(img_path, im[:, :, ::-1])
+	with tf.get_default_graph().as_default():
+		input_images = tf.placeholder(tf.float32, shape=[None, None, None, 3], name='input_images')
+		f_score, f_geometry = model.model(input_images, is_training=False)
+		global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
+		variable_averages = tf.train.ExponentialMovingAverage(0.997, global_step)
+                saver = tf.train.Saver(variable_averages.variables_to_restore())
+		with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
+		    ckpt_state = tf.train.get_checkpoint_state(FLAGS.checkpoint_path)
+                    model_path = os.path.join(FLAGS.checkpoint_path, os.path.basename(ckpt_state.model_checkpoint_path))
+		    saver.restore(sess, model_path)
+		    logging.info(model_path)
+		    with open('Data/cropped_annotations_train.txt', 'r') as f:
+		        annotation_file = f.readlines()
+		    count_right = 0
+		    count_wrong = 0
+		    count_posNotDetected = 0
+		    idx = 0
+		    for line in annotation_file:
+		        if len(line)>1 and line[:6] == './crop':
+		            logging.info(line)
+			    file_name = "Data/cropped_img_train/"+line[14:].split(".tiff",1)[0]+".tiff"
+		            num_true_pos = int(annotation_file[idx+1])
+		            count_right_cache = 0
+        		    logging.info(file_name)
+		            im = cv2.imread(file_name)[:, :, ::-1]
+		            im_resized, (ratio_h, ratio_w) = resize_image(im)
+		            score, geometry = sess.run([f_score, f_geometry], feed_dict={input_images: [im_resized]})
+		            boxes = detect(score_map=score, geo_map=geometry)
+		            if boxes is not None:
+		                boxes = boxes[:, :8].reshape((-1, 4, 2))
+		                boxes[:, :, 0] /= ratio_w
+		                boxes[:, :, 1] /= ratio_h
+		                for box in boxes:
+		                    box = sort_poly(box.astype(np.int32))
+		                    if np.linalg.norm(box[0] - box[1]) < 5 or np.linalg.norm(box[3]-box[0]) < 5:
+		                        continue
+		                    count_wrong += 1
+		                    for i in range(num_true_pos):
+		                        if (checkIOU(box, annotation_file[idx+2+i].split(" ")) == True):
+		                            count_right_cache += 1
+		                            count_wrong -= 1
+		            count_posNotDetected += num_true_pos - count_right_cache
+		            count_right += count_right_cache
+		        idx += 1
+		    precision = (float) (count_right) / (float) (count_right + count_wrong)  # TP / TP + FP
+		    recall = (float) (count_right) / (float) (count_right + count_posNotDetected)  # TP / TP + FN
+		    fscore = 2 * (precision * recall) / (precision + recall)
+		    logging.info("precision {:.4f}, recall {:.4f}, fscore {:.4f}".format(precision, recall, fscore))
 
 if __name__ == '__main__':
+    logging.basicConfig(filename='logexperiment.log', level=logging.INFO)
     tf.app.run()
